@@ -66,7 +66,7 @@ class DataPipeline:
 
     def is_duplicate(self, input_data):
         if input_data.name in self.names_seen:
-            logger.warn(f"Duplicate Item Found: {input_data.name}. Item dropped")
+            logger.warning(f"Duplicate Item Found: {input_data.name}. Item dropped")
             return True
         self.names_seen.append(input_data.name)
         return False
@@ -88,63 +88,68 @@ def get_scrapeops_url(url):
     proxy_url = 'https://proxy.scrapeops.io/v1/?' + urlencode(payload)
     return proxy_url
 
-#function to search a specific page
-def search_page(query, page, location="United States", headers=headers, pipeline=None):
-    #url of the page we want to scrape
-    url = f"https://www.google.com/search?q={query}&start={page * 10}&geo_location={location}"
+def search_page(query, page, location="United States", headers=headers, pipeline=None, num=100, retries=3):
+    url = f"https://www.google.com/search?q={query}&start={page * num}&num={num}"
     payload = {
         "api_key": API_KEY,
         "url": url,
     }
-    #get the scrapeops url response
-    response = requests.get(get_scrapeops_url(url))
-    #soup instance for parsing
-    soup = BeautifulSoup(response.text, 'html.parser')
-    #find all the divs
-    divs = soup.find_all("div")
-    #start our index at zero, this is the result number on each page
-    index = 0
-    last_link = ""
-    for div in divs:
-        #find all h3s, the original parser broke when doing this with a proxy
-        h3s = div.find_all("h3")
-        if len(h3s) > 0:
-            #find the link element
-            link = div.find("a", href=True)
-            #parse the url
-            parsed_url = urlparse(link["href"])
-            #reconstruct the base url
-            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            #site_info dict object
-            site_info = {'title': h3s[0].text, "base_url": base_url, 'link': link["href"], "page": page, "result_number": index}
-            search_data = SearchData(
-                name = site_info["title"],
-                base_url = site_info["base_url"],
-                link = site_info["link"],
-                page = site_info["page"],
-                result_number = site_info["result_number"]
-            )            
-            #if our link is different process the result
-            if site_info["link"] != last_link:
-                index += 1
-                last_link = site_info["link"]
-                if pipeline:
-                    pipeline.add_data(search_data)
+    tries = 0
+    success = False
+    while tries <= retries and not success:
+        try:
+            response = requests.get(get_scrapeops_url(url))
+            soup = BeautifulSoup(response.text, 'html.parser')
+            divs = soup.find_all("div")
+            index = 0
+            last_link = ""
+            for div in divs:
+                h3s = div.find_all("h3")
+                if len(h3s) > 0:
+                    link = div.find("a", href=True)
+                    parsed_url = urlparse(link["href"])
+                    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                    site_info = {'title': h3s[0].text, "base_url": base_url, 'link': link["href"], "page": page, "result_number": index}
+                    search_data = SearchData(
+                        name = site_info["title"],
+                        base_url = site_info["base_url"],
+                        link = site_info["link"],
+                        page = site_info["page"],
+                        result_number = site_info["result_number"]
+                    )            
+                    if site_info["link"] != last_link:
+                        index += 1
+                        last_link = site_info["link"]
+                        if pipeline:
+                            pipeline.add_data(search_data)
+                            success = True
+
+        except:
+            print(f"Failed to scrape page {page}")
+            print(f"Retries left: {retries-tries}")
+            tries += 1
+    if not success:
+        print(f"Failed to scrape page {page}, no retries left")
+        raise Exception(f"Max retries exceeded: {retries}")
+    else:
+        print(f"Scraped page {page} with {retries-tries} retries left")
+
+def full_search(query, pages=3, location="us", MAX_THREADS=5, MAX_RETRIES=3, num=10):
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        pipeline = DataPipeline(csv_filename=f"{query.replace(' ', '-')}.csv")
+        tasks = [executor.submit(search_page, query, page, location, None, pipeline, num, MAX_RETRIES) for page in range(pages)]
+        for future in tasks:
+            future.result()
+        pipeline.close_pipeline()
 
 if __name__ == "__main__":
-    logger.info("Log Starting")
+    MAX_THREADS = 5
+    MAX_RETRIES = 5
+    queries = ["cool stuff"]
 
-    keywords = ["cool stuff"]
 
+    logger.info("Starting full search...")
+    for query in queries:
+        full_search(query, pages=3, num=10)
+    logger.info("Search complete.")
 
-    for keyword in keywords: 
-        filename = keyword.replace(" ", "-")   
-        data_pipeline = DataPipeline(csv_filename=f"{filename}.csv")
-        try:
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                tasks = {executor.submit(search_page, keywords[0], page, "United States", headers, data_pipeline): page for page in range(3)}
-                for future in concurrent.futures.as_completed(tasks):
-                    future.result()
-        finally:
-            data_pipeline.close_pipeline()
-            logger.info("Scrape Complete")
